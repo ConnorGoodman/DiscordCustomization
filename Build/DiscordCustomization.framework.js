@@ -1160,26 +1160,26 @@ var tempDouble;
 var tempI64;
 
 var ASM_CONSTS = {
- 3380788: function() {
+ 3391748: function() {
   Module["emscripten_get_now_backup"] = performance.now;
  },
- 3380843: function($0) {
+ 3391803: function($0) {
   performance.now = function() {
    return $0;
   };
  },
- 3380891: function($0) {
+ 3391851: function($0) {
   performance.now = function() {
    return $0;
   };
  },
- 3380939: function() {
+ 3391899: function() {
   performance.now = Module["emscripten_get_now_backup"];
  },
- 3380994: function() {
+ 3391954: function() {
   return Module.webglContextAttributes.premultipliedAlpha;
  },
- 3381055: function() {
+ 3392015: function() {
   return Module.webglContextAttributes.preserveDrawingBuffer;
  }
 };
@@ -2693,6 +2693,200 @@ function _JS_SystemInfo_HasWebGL() {
 
 function _JS_UnityEngineShouldQuit() {
  return !!Module.shouldQuit;
+}
+
+var wr = {
+ requests: {},
+ responses: {},
+ abortControllers: {},
+ timer: {},
+ nextRequestId: 1
+};
+
+function _JS_WebRequest_Abort(requestId) {
+ var abortController = wr.abortControllers[requestId];
+ if (!abortController || abortController.signal.aborted) {
+  return;
+ }
+ abortController.abort();
+}
+
+function _JS_WebRequest_Create(url, method) {
+ var _url = UTF8ToString(url);
+ var _method = UTF8ToString(method);
+ var abortController = new AbortController();
+ var requestOptions = {
+  url: _url,
+  init: {
+   method: _method,
+   signal: abortController.signal,
+   headers: {}
+  }
+ };
+ wr.abortControllers[wr.nextRequestId] = abortController;
+ wr.requests[wr.nextRequestId] = requestOptions;
+ return wr.nextRequestId++;
+}
+
+function jsWebRequestGetResponseHeaderString(requestId) {
+ var response = wr.responses[requestId];
+ if (!response) {
+  return "";
+ }
+ if (response.headerString) {
+  return response.headerString;
+ }
+ var headers = "";
+ var entries = response.headers.entries();
+ for (var result = entries.next(); !result.done; result = entries.next()) {
+  headers += result.value[0] + ": " + result.value[1] + "\r\n";
+ }
+ response.headerString = headers;
+ return headers;
+}
+
+function _JS_WebRequest_GetResponseMetaData(requestId, headerBuffer, headerSize, responseUrlBuffer, responseUrlSize) {
+ var response = wr.responses[requestId];
+ if (!response) {
+  stringToUTF8("", headerBuffer, headerSize);
+  stringToUTF8("", responseUrlBuffer, responseUrlSize);
+  return;
+ }
+ if (headerBuffer) {
+  var headers = jsWebRequestGetResponseHeaderString(requestId);
+  stringToUTF8(headers, headerBuffer, headerSize);
+ }
+ if (responseUrlBuffer) {
+  stringToUTF8(response.url, responseUrlBuffer, responseUrlSize);
+ }
+}
+
+function _JS_WebRequest_GetResponseMetaDataLengths(requestId, buffer) {
+ var response = wr.responses[requestId];
+ if (!response) {
+  HEAPU32[buffer >> 2] = 0;
+  HEAPU32[(buffer >> 2) + 1] = 0;
+  return;
+ }
+ var headers = jsWebRequestGetResponseHeaderString(requestId);
+ HEAPU32[buffer >> 2] = lengthBytesUTF8(headers);
+ HEAPU32[(buffer >> 2) + 1] = lengthBytesUTF8(response.url);
+}
+
+function _JS_WebRequest_Release(requestId) {
+ if (wr.timer[requestId]) {
+  clearTimeout(wr.timer[requestId]);
+ }
+ delete wr.requests[requestId];
+ delete wr.responses[requestId];
+ delete wr.abortControllers[requestId];
+ delete wr.timer[requestId];
+}
+
+function _JS_WebRequest_Send(requestId, ptr, length, arg, onresponse, onprogress) {
+ var requestOptions = wr.requests[requestId];
+ var abortController = wr.abortControllers[requestId];
+ function ClearTimeout() {
+  if (wr.timer[requestId]) {
+   clearTimeout(wr.timer[requestId]);
+   delete wr.timer[requestId];
+  }
+ }
+ function HandleSuccess(response, body) {
+  ClearTimeout();
+  if (!onresponse) {
+   return;
+  }
+  var kWebRequestOK = 0;
+  if (body.length != 0) {
+   var buffer = _malloc(body.length);
+   HEAPU8.set(body, buffer);
+   dynCall("viiiiii", onresponse, [ arg, response.status, buffer, body.length, 0, kWebRequestOK ]);
+  } else {
+   dynCall("viiiiii", onresponse, [ arg, response.status, 0, 0, 0, kWebRequestOK ]);
+  }
+ }
+ function HandleError(err, code) {
+  ClearTimeout();
+  if (!onresponse) {
+   return;
+  }
+  var len = lengthBytesUTF8(err) + 1;
+  var buffer = _malloc(len);
+  stringToUTF8(err, buffer, len);
+  dynCall("viiiiii", onresponse, [ arg, 500, 0, 0, buffer, code ]);
+  _free(buffer);
+ }
+ function HandleProgress(e) {
+  if (!onprogress || !e.lengthComputable) {
+   return;
+  }
+  dynCall("viii", onprogress, [ arg, e.loaded, e.total ]);
+ }
+ try {
+  if (length > 0) {
+   var postData = HEAPU8.subarray(ptr, ptr + length);
+   requestOptions.init.body = new Blob([ postData ]);
+  }
+  if (requestOptions.timeout) {
+   wr.timer[requestId] = setTimeout(function() {
+    requestOptions.isTimedOut = true;
+    abortController.abort();
+   }, requestOptions.timeout);
+  }
+  var fetchImpl = Module.fetchWithProgress;
+  requestOptions.init.onProgress = HandleProgress;
+  if (Module.companyName && Module.productName && Module.cachedFetch) {
+   fetchImpl = Module.cachedFetch;
+   requestOptions.init.companyName = Module.companyName;
+   requestOptions.init.productName = Module.productName;
+   requestOptions.control = Module.cacheControl(requestOptions.url);
+  }
+  fetchImpl(requestOptions.url, requestOptions.init).then(function(response) {
+   wr.responses[requestId] = response;
+   HandleSuccess(response, response.parsedBody);
+  }).catch(function(error) {
+   var kWebErrorUnknown = 2;
+   var kWebErrorAborted = 17;
+   var kWebErrorTimeout = 14;
+   if (requestOptions.isTimedOut) {
+    HandleError("Connection timed out.", kWebErrorTimeout);
+   } else if (abortController.signal.aborted) {
+    HandleError("Aborted.", kWebErrorAborted);
+   } else {
+    HandleError(error.message, kWebErrorUnknown);
+   }
+  });
+ } catch (error) {
+  var kWebErrorUnknown = 2;
+  HandleError(error.message, kWebErrorUnknown);
+ }
+}
+
+function _JS_WebRequest_SetRedirectLimit(request, redirectLimit) {
+ var requestOptions = wr.requests[request];
+ if (!requestOptions) {
+  return;
+ }
+ requestOptions.init.redirect = redirectLimit === 0 ? "error" : "follow";
+}
+
+function _JS_WebRequest_SetRequestHeader(requestId, header, value) {
+ var requestOptions = wr.requests[requestId];
+ if (!requestOptions) {
+  return;
+ }
+ var _header = UTF8ToString(header);
+ var _value = UTF8ToString(value);
+ requestOptions.init.headers[_header] = _value;
+}
+
+function _JS_WebRequest_SetTimeout(requestId, timeout) {
+ var requestOptions = wr.requests[requestId];
+ if (!requestOptions) {
+  return;
+ }
+ requestOptions.timeout = timeout;
 }
 
 var ExceptionInfoAttrs = {
@@ -13490,6 +13684,15 @@ var asmLibraryArg = {
  "JS_SystemInfo_HasFullscreen": _JS_SystemInfo_HasFullscreen,
  "JS_SystemInfo_HasWebGL": _JS_SystemInfo_HasWebGL,
  "JS_UnityEngineShouldQuit": _JS_UnityEngineShouldQuit,
+ "JS_WebRequest_Abort": _JS_WebRequest_Abort,
+ "JS_WebRequest_Create": _JS_WebRequest_Create,
+ "JS_WebRequest_GetResponseMetaData": _JS_WebRequest_GetResponseMetaData,
+ "JS_WebRequest_GetResponseMetaDataLengths": _JS_WebRequest_GetResponseMetaDataLengths,
+ "JS_WebRequest_Release": _JS_WebRequest_Release,
+ "JS_WebRequest_Send": _JS_WebRequest_Send,
+ "JS_WebRequest_SetRedirectLimit": _JS_WebRequest_SetRedirectLimit,
+ "JS_WebRequest_SetRequestHeader": _JS_WebRequest_SetRequestHeader,
+ "JS_WebRequest_SetTimeout": _JS_WebRequest_SetTimeout,
  "__cxa_allocate_exception": ___cxa_allocate_exception,
  "__cxa_atexit": ___cxa_atexit,
  "__cxa_begin_catch": ___cxa_begin_catch,
